@@ -476,6 +476,33 @@ extension WorkmanagerPlugin {
     /// user AppDelegate registrations) against double registration.
     private static var registeredLaunchHandlers: Set<String> = []
 
+    /// Guards `registeredLaunchHandlers` and `refreshStopsByIdentifier`:
+    /// they are reached from the main queue (AppDelegate, the Dart API) and
+    /// from BGTaskScheduler's own queue (a launch handler resubmitting).
+    private static let registrationLock = NSLock()
+
+    private static var refreshStopsByIdentifier: [String: RefreshTaskStops] = [:]
+
+    /// The input-data key under which a periodic task's Dart handler finds
+    /// the time its launch handler was entered (ms since the epoch).
+    public static let launchedAtInputKey = "_launchedAtMs"
+
+    static func refreshStops(forTaskIdentifier identifier: String) -> RefreshTaskStops? {
+        registrationLock.lock()
+        defer { registrationLock.unlock() }
+        return refreshStopsByIdentifier[identifier]
+    }
+
+    /// The persisted record of what the plugin did with its refresh tasks:
+    /// launches, registrations, launch-handler entries, submits and their
+    /// errors, stops, expirations and completions — the last 200, oldest
+    /// first. Each entry has `seq` (Int), `at` (ms since the epoch) and
+    /// `event`, and optionally `id` (the task identifier) and `detail`.
+    @objc
+    public static func refreshTaskLog() -> [[String: Any]] {
+        return RefreshTaskLog.entries()
+    }
+
     @available(iOS 13.0, *)
     private static func handleBGProcessingTask(identifier: String, task: BGProcessingTask) {
         let operationQueue = OperationQueue()
@@ -503,32 +530,55 @@ extension WorkmanagerPlugin {
     ///   - inputData: Input data passed from the Dart side (may be nil)
     @available(iOS 13.0, *)
     public static func handlePeriodicTask(identifier: String, task: BGAppRefreshTask, earliestBeginInSeconds: NSNumber?, inputData: [String: Any]?) {
+        let launchedAt = Date()
+        RefreshTaskLog.record("handler", identifier: identifier)
+        let run = RefreshTaskRun(task: task, identifier: identifier)
+
+        // Schedule the next occurrence FIRST (iOS will determine actual
+        // timing based on usage patterns) — before anything that can end
+        // this delivery early, so a run that cannot start still leaves the
+        // periodic chain alive. A refused submit is retried.
+        let begin = earliestBeginInSeconds?.doubleValue
+        run.submitNext { submitPeriodicTask(taskIdentifier: task.identifier, earliestBeginInSeconds: begin) }
+
+        task.expirationHandler = { run.expire() }
+
         guard let callbackHandle = UserDefaultsHelper.getStoredCallbackHandle(),
               FlutterCallbackCache.lookupCallbackInformation(callbackHandle) != nil
         else {
             logError("[\(String(describing: self))] \(WMPError.workmanagerNotInitialized.message)")
+            RefreshTaskLog.record("callback handle not resolved", identifier: identifier)
+            // Nothing to run, but the task was delivered: complete it, or
+            // iOS waits it out and counts it against the app.
+            run.finish(success: false)
             return
         }
 
-        // Schedule the next occurrence (iOS will determine actual timing based on usage patterns)
-        schedulePeriodicTask(taskIdentifier: task.identifier, earliestBeginInSeconds: earliestBeginInSeconds?.doubleValue)
+        // The Dart task learns when this delivery began: its own clock
+        // starts only after the engine is up. A per-run copy — the stored
+        // input data is not touched.
+        var runInputData = inputData ?? [:]
+        runInputData[launchedAtInputKey] = Int64(launchedAt.timeIntervalSince1970 * 1000)
 
         // Execute the Flutter task directly
         let worker = BackgroundWorker(
             mode: .backgroundPeriodicTask(identifier: identifier),
-            inputData: inputData,
+            inputData: runInputData,
             flutterPluginRegistrantCallback: flutterPluginRegistrantCallback
         )
 
-        // Set up expiration handler
-        task.expirationHandler = {
-            logInfo("BGAppRefreshTask expired: \(identifier)")
+        if let stops = refreshStops(forTaskIdentifier: identifier) {
+            run.arm(stops, launchedAt: launchedAt)
         }
 
         // Execute on main thread (required for Flutter)
         DispatchQueue.main.async {
+            run.worker = worker
+            RefreshTaskLog.record("engine starting", identifier: identifier)
             worker.performBackgroundRequest { result in
-                task.setTaskCompleted(success: result == .newData)
+                RefreshTaskLog.record(
+                    "dart returned", identifier: identifier, detail: result.debugDescription)
+                run.finish(success: result == .newData)
             }
         }
     }
@@ -708,6 +758,49 @@ extension WorkmanagerPlugin {
     ///   from Dart to actually schedule the task with inputData.
     @objc
     public static func registerPeriodicTask(withIdentifier identifier: String, earliestBeginInSeconds: NSNumber? = nil) {
+        registerPeriodicTask(
+            withIdentifier: identifier,
+            earliestBeginInSeconds: earliestBeginInSeconds,
+            softStopAfter: nil,
+            hardStopAfter: nil
+        )
+    }
+
+    /// Registers a periodic background task whose every run is bounded.
+    ///
+    /// iOS gives a BGAppRefreshTask about 30 seconds and kills an app that
+    /// overruns, counting it against the app's later launches. The two
+    /// instants, in seconds from the launch-handler entry, let the app end
+    /// a run itself:
+    ///
+    /// - Parameters:
+    ///   - softStopAfter: The Dart task is told to stop through
+    ///     `executeTask(onTaskStopped:)`. Nothing is forced.
+    ///   - hardStopAfter: The background engine is destroyed and the task
+    ///     completed with `success: false`, whatever the Dart task is doing
+    ///     — also when the engine never came up.
+    ///
+    /// An expiration from iOS completes the task at once either way.
+    @objc
+    public static func registerPeriodicTask(
+        withIdentifier identifier: String,
+        earliestBeginInSeconds: NSNumber?,
+        softStopAfter: NSNumber?,
+        hardStopAfter: NSNumber?
+    ) {
+        registrationLock.lock()
+        if softStopAfter != nil || hardStopAfter != nil {
+            refreshStopsByIdentifier[identifier] = RefreshTaskStops(
+                softAfter: softStopAfter?.doubleValue,
+                hardAfter: hardStopAfter?.doubleValue
+            )
+        } else {
+            refreshStopsByIdentifier[identifier] = nil
+        }
+        registrationLock.unlock()
+        RefreshTaskLog.record(
+            "launch", identifier: identifier,
+            detail: "applicationState=\(applicationStateName())")
         if #available(iOS 13.0, *) {
             UserDefaultsHelper.storeScheduledTask(
                 ScheduledTaskInfo(kind: .refresh, earliestBeginInSeconds: earliestBeginInSeconds?.doubleValue),
@@ -730,8 +823,20 @@ extension WorkmanagerPlugin {
         registerPeriodicTask(withIdentifier: identifier, earliestBeginInSeconds: frequency)
     }
 
+    /// Submits a refresh request; a refusal is logged, recorded and
+    /// otherwise ignored (the Dart-side registration path).
     @available(iOS 13.0, *)
     private static func schedulePeriodicTask(taskIdentifier identifier: String, earliestBeginInSeconds begin: Double?) {
+        if let error = submitPeriodicTask(taskIdentifier: identifier, earliestBeginInSeconds: begin) {
+            RefreshTaskLog.record("submit failed", identifier: identifier, detail: error.localizedDescription)
+        } else {
+            RefreshTaskLog.record("submit ok", identifier: identifier)
+        }
+    }
+
+    /// Submits a refresh request and answers the error iOS refused it with.
+    @available(iOS 13.0, *)
+    static func submitPeriodicTask(taskIdentifier identifier: String, earliestBeginInSeconds begin: Double?) -> Error? {
         let request = BGAppRefreshTaskRequest(identifier: identifier)
         if let begin = begin {
             request.earliestBeginDate = Date(timeIntervalSinceNow: begin)
@@ -747,8 +852,20 @@ extension WorkmanagerPlugin {
                 forTaskWithIdentifier: identifier,
                 earliestBeginInSeconds: begin.map { NSNumber(value: $0) }
             )
+            return nil
         } catch {
             logInfo("Could not schedule BGAppRefreshTask \(error.localizedDescription)")
+            return error
+        }
+    }
+
+    private static func applicationStateName() -> String {
+        guard Thread.isMainThread else { return "unknown" }
+        switch UIApplication.shared.applicationState {
+        case .active: return "active"
+        case .inactive: return "inactive"
+        case .background: return "background"
+        @unknown default: return "unknown"
         }
     }
 
@@ -881,11 +998,15 @@ extension WorkmanagerPlugin {
         forTaskWithIdentifier identifier: String,
         earliestBeginInSeconds: NSNumber?
     ) {
-        guard !registeredLaunchHandlers.contains(identifier) else {
+        // Claimed under the lock before registering: BGTaskScheduler kills
+        // the app on a second registration of one identifier.
+        registrationLock.lock()
+        let claimed = registeredLaunchHandlers.insert(identifier).inserted
+        registrationLock.unlock()
+        guard claimed else {
             return
         }
-        registeredLaunchHandlers.insert(identifier)
-        BGTaskScheduler.shared.register(
+        let registered = BGTaskScheduler.shared.register(
             forTaskWithIdentifier: identifier,
             using: nil
         ) { task in
@@ -908,6 +1029,18 @@ extension WorkmanagerPlugin {
             } else if let task = task as? BGProcessingTask {
                 handleBGProcessingTask(identifier: identifier, task: task)
             }
+        }
+        RefreshTaskLog.record(
+            registered ? "register ok" : "register refused", identifier: identifier)
+        if !registered {
+            // iOS refused (an identifier missing from
+            // BGTaskSchedulerPermittedIdentifiers, or a registration after
+            // launch): no task will be delivered. Not claimed, so a later
+            // launch-time registration is not shadowed by this one.
+            logError("BGTaskScheduler refused the launch handler for \(identifier)")
+            registrationLock.lock()
+            registeredLaunchHandlers.remove(identifier)
+            registrationLock.unlock()
         }
     }
 

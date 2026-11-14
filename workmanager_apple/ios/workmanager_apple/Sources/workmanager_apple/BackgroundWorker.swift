@@ -93,6 +93,13 @@ class BackgroundWorker {
     let flutterPluginRegistrantCallback: WMPFlutterPluginRegistrantCallback?
     let inputData: [String: Any]?
 
+    /// The headless engine and its API while a request is running, so the
+    /// task can be told to stop or the engine destroyed from outside the
+    /// request's own completion. Main queue only.
+    private var flutterEngine: FlutterEngine?
+    private var flutterApi: WorkmanagerFlutterApi?
+    private var runningTaskName: String?
+
     init(
         mode: BackgroundMode, inputData: [String: Any]?,
         flutterPluginRegistrantCallback: WMPFlutterPluginRegistrantCallback?
@@ -156,11 +163,12 @@ class BackgroundWorker {
 
         WorkmanagerDebug.onTaskStatusUpdate(taskInfo: taskInfo, status: .started)
 
-        var flutterEngine: FlutterEngine? = FlutterEngine(
+        flutterEngine = FlutterEngine(
             name: backgroundMode.flutterThreadlabelPrefix,
             project: nil,
             allowHeadlessExecution: true
         )
+        runningTaskName = taskName
 
 #if os(iOS)
         flutterEngine!.run(
@@ -172,17 +180,9 @@ class BackgroundWorker {
 #endif
         flutterPluginRegistrantCallback?(flutterEngine!)
 
-        var flutterApi: WorkmanagerFlutterApi? = WorkmanagerFlutterApi(binaryMessenger: flutterEngine!.binaryMessenger)
+        flutterApi = WorkmanagerFlutterApi(binaryMessenger: flutterEngine!.binaryMessenger)
 
-        func cleanupFlutterResources() {
-#if os(iOS)
-            flutterEngine?.destroyContext()
-#elseif os(macOS)
-            flutterEngine?.shutDownEngine()
-#endif
-            flutterApi = nil
-            flutterEngine = nil
-        }
+        let cleanupFlutterResources = { self.destroyEngine() }
 
         // Initialize the background channel and execute the task
         flutterApi?.backgroundChannelInitialized { result in
@@ -198,7 +198,7 @@ class BackgroundWorker {
                 }
 
                 // Execute the task
-                flutterApi?.executeTask(taskName: taskName, inputData: pigeonInputData) { taskResult in
+                self.flutterApi?.executeTask(taskName: taskName, inputData: pigeonInputData) { taskResult in
                     cleanupFlutterResources()
                     let taskSessionCompleter = Date()
 
@@ -244,6 +244,28 @@ class BackgroundWorker {
         }
 
         return true
+    }
+
+    /// Tells the running Dart task that the platform is about to stop it
+    /// (`executeTask(onTaskStopped:)` on the Dart side), so it can wind down
+    /// on its own. A no-op when nothing is running. Main queue only.
+    func requestStop() {
+        guard let api = flutterApi, let taskName = runningTaskName else { return }
+        // 1 = StopReason.timeout: the task ran out of its time.
+        api.onTaskStopped(taskName: taskName, stopReason: 1) { _ in }
+    }
+
+    /// Destroys the headless engine, whatever the Dart task is doing.
+    /// Idempotent. Main queue only.
+    func destroyEngine() {
+#if os(iOS)
+        flutterEngine?.destroyContext()
+#elseif os(macOS)
+        flutterEngine?.shutDownEngine()
+#endif
+        flutterApi = nil
+        flutterEngine = nil
+        runningTaskName = nil
     }
 
     /// Entrypoint information used to start the background engine.
