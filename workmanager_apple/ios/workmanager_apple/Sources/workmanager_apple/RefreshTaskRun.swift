@@ -31,6 +31,21 @@ enum RefreshTaskLog {
     private static let defaults = UserDefaults(suiteName: "\(WorkmanagerPlugin.identifier).userDefaults")!
     private static let entriesKey = "\(WorkmanagerPlugin.identifier).refreshTaskLog"
     private static let sequenceKey = "\(WorkmanagerPlugin.identifier).refreshTaskLog.seq"
+    private static let lastHandlerKey = "\(WorkmanagerPlugin.identifier).refreshTaskLog.lastHandler"
+
+    /// The launch-handler entry: iOS delivered a refresh task. Its entry
+    /// says how long ago the previous one was — the one number that shows
+    /// a chain that slowed down or stopped.
+    static let handlerEvent = "handler"
+
+    /// "3 d 4 h", "2 h 10 min", "17 min", "40 s".
+    static func span(_ interval: TimeInterval) -> String {
+        let s = Int(max(0, interval))
+        if s >= 86400 { return "\(s / 86400) d \(s % 86400 / 3600) h" }
+        if s >= 3600 { return "\(s / 3600) h \(s % 3600 / 60) min" }
+        if s >= 60 { return "\(s / 60) min" }
+        return "\(s) s"
+    }
 
     /// Appends an event. Safe from any queue; returns at once.
     static func record(_ event: String, identifier: String? = nil, detail: String? = nil) {
@@ -45,6 +60,15 @@ enum RefreshTaskLog {
     }
 
     private static func append(_ event: String, identifier: String?, detail: String?, at: Date) {
+        var detail = detail
+        if event == handlerEvent {
+            let previous = defaults.double(forKey: lastHandlerKey)
+            let gap = previous > 0
+                ? "previous one \(span(at.timeIntervalSince1970 - previous)) ago"
+                : "first one recorded"
+            detail = detail.map { "\(gap), \($0)" } ?? gap
+            defaults.set(at.timeIntervalSince1970, forKey: lastHandlerKey)
+        }
         var entries = defaults.array(forKey: entriesKey) as? [[String: Any]] ?? []
         let seq = defaults.integer(forKey: sequenceKey) + 1
         var entry: [String: Any] = [
@@ -102,6 +126,7 @@ final class RefreshTaskRun {
     /// at once and the retry lost.
     private var submitPending = false
     private var heldCompletion: Bool?
+    private var submitDetail: String?
 
     /// How long after a failed submit the next attempt is made.
     static let submitRetryDelays: [TimeInterval] = [1, 3, 8]
@@ -116,8 +141,9 @@ final class RefreshTaskRun {
     /// Submits the next request now and, when iOS refuses it, again after
     /// each of `submitRetryDelays`. Without a pending request the periodic
     /// chain is over until the app is next opened.
-    func submitNext(_ submit: @escaping () -> Error?) {
+    func submitNext(detail: String? = nil, _ submit: @escaping () -> Error?) {
         queue.async {
+            self.submitDetail = detail
             self.submitPending = true
             self.trySubmit(submit, attempt: 0)
         }
@@ -137,7 +163,7 @@ final class RefreshTaskRun {
                 return
             }
         } else {
-            RefreshTaskLog.recordOnQueue("submit ok", identifier: identifier)
+            RefreshTaskLog.recordOnQueue("submit ok", identifier: identifier, detail: submitDetail)
         }
         submitPending = false
         if let success = heldCompletion {

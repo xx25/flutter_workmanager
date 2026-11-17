@@ -531,7 +531,9 @@ extension WorkmanagerPlugin {
     @available(iOS 13.0, *)
     public static func handlePeriodicTask(identifier: String, task: BGAppRefreshTask, earliestBeginInSeconds: NSNumber?, inputData: [String: Any]?) {
         let launchedAt = Date()
-        RefreshTaskLog.record("handler", identifier: identifier)
+        RefreshTaskLog.record(
+            RefreshTaskLog.handlerEvent, identifier: identifier,
+            detail: "lowPower=\(ProcessInfo.processInfo.isLowPowerModeEnabled ? "on" : "off")")
         let run = RefreshTaskRun(task: task, identifier: identifier)
 
         // Schedule the next occurrence FIRST (iOS will determine actual
@@ -539,7 +541,7 @@ extension WorkmanagerPlugin {
         // this delivery early, so a run that cannot start still leaves the
         // periodic chain alive. A refused submit is retried.
         let begin = earliestBeginInSeconds?.doubleValue
-        run.submitNext { submitPeriodicTask(taskIdentifier: task.identifier, earliestBeginInSeconds: begin) }
+        run.submitNext(detail: earliestBeginDetail(begin)) { submitPeriodicTask(taskIdentifier: task.identifier, earliestBeginInSeconds: begin) }
 
         task.expirationHandler = { run.expire() }
 
@@ -574,7 +576,11 @@ extension WorkmanagerPlugin {
         // Execute on main thread (required for Flutter)
         DispatchQueue.main.async {
             run.worker = worker
-            RefreshTaskLog.record("engine starting", identifier: identifier)
+            RefreshTaskLog.record(
+                "engine starting", identifier: identifier,
+                detail: String(
+                    format: "%.1f s after the handler, %@",
+                    Date().timeIntervalSince(launchedAt), refreshConditions()))
             worker.performBackgroundRequest { result in
                 RefreshTaskLog.record(
                     "dart returned", identifier: identifier, detail: result.debugDescription)
@@ -800,7 +806,8 @@ extension WorkmanagerPlugin {
         registrationLock.unlock()
         RefreshTaskLog.record(
             "launch", identifier: identifier,
-            detail: "applicationState=\(applicationStateName())")
+            detail: refreshConditions())
+        observeBackgroundEntryOnce()
         if #available(iOS 13.0, *) {
             UserDefaultsHelper.storeScheduledTask(
                 ScheduledTaskInfo(kind: .refresh, earliestBeginInSeconds: earliestBeginInSeconds?.doubleValue),
@@ -830,8 +837,13 @@ extension WorkmanagerPlugin {
         if let error = submitPeriodicTask(taskIdentifier: identifier, earliestBeginInSeconds: begin) {
             RefreshTaskLog.record("submit failed", identifier: identifier, detail: error.localizedDescription)
         } else {
-            RefreshTaskLog.record("submit ok", identifier: identifier)
+            RefreshTaskLog.record("submit ok", identifier: identifier, detail: earliestBeginDetail(begin))
         }
+    }
+
+    private static func earliestBeginDetail(_ begin: Double?) -> String {
+        guard let begin = begin else { return "no earliest time" }
+        return "not before \(RefreshTaskLog.span(begin)) from now"
     }
 
     /// Submits a refresh request and answers the error iOS refused it with.
@@ -856,6 +868,57 @@ extension WorkmanagerPlugin {
         } catch {
             logInfo("Could not schedule BGAppRefreshTask \(error.localizedDescription)")
             return error
+        }
+    }
+
+    /// What iOS allows right now, for the record: the app's state, the
+    /// Background App Refresh switch, Low Power Mode. Main thread only —
+    /// elsewhere the UIKit answers read "unknown".
+    private static func refreshConditions() -> String {
+        var refresh = "unknown"
+        if Thread.isMainThread {
+            switch UIApplication.shared.backgroundRefreshStatus {
+            case .available: refresh = "available"
+            case .denied: refresh = "denied"
+            case .restricted: refresh = "restricted"
+            @unknown default: refresh = "unknown"
+            }
+        }
+        let lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled ? "on" : "off"
+        return "applicationState=\(applicationStateName()), refresh=\(refresh), lowPower=\(lowPower)"
+    }
+
+    private static var observingBackgroundEntry = false
+
+    /// Records, each time the app leaves the screen, whether iOS holds a
+    /// refresh request for it. Without one no task will ever be delivered:
+    /// this is the line that tells "iOS did not wake the app" from "there
+    /// was nothing for iOS to wake it for".
+    private static func observeBackgroundEntryOnce() {
+        registrationLock.lock()
+        let already = observingBackgroundEntry
+        observingBackgroundEntry = true
+        registrationLock.unlock()
+        guard !already, #available(iOS 13.0, *) else { return }
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
+        ) { _ in
+            let conditions = refreshConditions()
+            BGTaskScheduler.shared.getPendingTaskRequests { requests in
+                let refresh = requests.compactMap { $0 as? BGAppRefreshTaskRequest }
+                let pending: String
+                if let request = refresh.first {
+                    let wait = request.earliestBeginDate?.timeIntervalSinceNow ?? 0
+                    pending = wait > 0
+                        ? "request pending, not before \(RefreshTaskLog.span(wait)) from now"
+                        : "request pending, due"
+                } else {
+                    pending = "NO request pending"
+                }
+                RefreshTaskLog.record(
+                    "entered background", identifier: refresh.first?.identifier,
+                    detail: "\(pending), \(conditions)")
+            }
         }
     }
 
