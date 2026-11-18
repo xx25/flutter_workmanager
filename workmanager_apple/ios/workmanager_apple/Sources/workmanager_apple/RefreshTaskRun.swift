@@ -93,6 +93,24 @@ enum RefreshTaskLog {
     }
 }
 
+/// The app's cancellations of refresh requests, counted. A resubmission
+/// retry queued before a cancel must not recreate the request after it:
+/// the retry compares the count it started under. Read and written on
+/// `RefreshTaskLog.queue`.
+enum RefreshCancellations {
+    private static var count = 0
+
+    /// The app cancelled one or all requests. Safe from any queue.
+    static func note() {
+        RefreshTaskLog.queue.async { count += 1 }
+    }
+
+    static var countOnQueue: Int {
+        dispatchPrecondition(condition: .onQueue(RefreshTaskLog.queue))
+        return count
+    }
+}
+
 /// When a refresh task is told to stop, counted from the launch-handler
 /// entry. iOS gives a BGAppRefreshTask about 30 seconds and kills an app
 /// that overruns; neither instant is set unless the app asks.
@@ -127,6 +145,7 @@ final class RefreshTaskRun {
     private var submitPending = false
     private var heldCompletion: Bool?
     private var submitDetail: String?
+    private var cancellationsAtSubmit = 0
     /// Held so the timers live as long as the run; they fire once and
     /// find `completed` set when the run ended first.
     private var stopTimers: [DispatchSourceTimer] = []
@@ -147,6 +166,7 @@ final class RefreshTaskRun {
     func submitNext(detail: String? = nil, _ submit: @escaping () -> Error?) {
         queue.async {
             self.submitDetail = detail
+            self.cancellationsAtSubmit = RefreshCancellations.countOnQueue
             self.submitPending = true
             self.trySubmit(submit, attempt: 0)
         }
@@ -154,7 +174,15 @@ final class RefreshTaskRun {
 
     private func trySubmit(_ submit: @escaping () -> Error?, attempt: Int) {
         dispatchPrecondition(condition: .onQueue(queue))
-        if let error = submit() {
+        if attempt > 0, RefreshCancellations.countOnQueue != cancellationsAtSubmit {
+            // A retry only: the app cancelled its requests meanwhile, and
+            // submitting now would bring back a request the user has just
+            // switched off. (A retry after the task was COMPLETED still
+            // runs if the process does: without a pending request the
+            // chain is over.)
+            RefreshTaskLog.recordOnQueue(
+                "submit retry dropped", identifier: identifier, detail: "cancelled by the app")
+        } else if let error = submit() {
             RefreshTaskLog.recordOnQueue(
                 "submit failed", identifier: identifier, detail: error.localizedDescription)
             if attempt < RefreshTaskRun.submitRetryDelays.count, !completed {

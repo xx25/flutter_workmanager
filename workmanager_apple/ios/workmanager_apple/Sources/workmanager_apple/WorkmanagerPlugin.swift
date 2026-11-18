@@ -252,6 +252,7 @@ public class WorkmanagerPlugin: WorkmanagerPluginBase, FlutterPlugin, Workmanage
 
     func cancelByUniqueName(uniqueName: String, completion: @escaping (Result<Void, Error>) -> Void) {
         executeIfSupportedVoid(completion: completion, feature: "cancelByUniqueName") {
+            RefreshCancellations.note()
             BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: uniqueName)
             UserDefaultsHelper.removeScheduledTask(uniqueName)
             WorkInfoStore.markCancelled(uniqueName: uniqueName)
@@ -260,6 +261,7 @@ public class WorkmanagerPlugin: WorkmanagerPluginBase, FlutterPlugin, Workmanage
 
     func cancelAll(completion: @escaping (Result<Void, Error>) -> Void) {
         executeIfSupportedVoid(completion: completion, feature: "cancelAll") {
+            RefreshCancellations.note()
             BGTaskScheduler.shared.cancelAllTaskRequests()
             UserDefaultsHelper.removeAllScheduledTasks()
             WorkInfoStore.markAllCancelled()
