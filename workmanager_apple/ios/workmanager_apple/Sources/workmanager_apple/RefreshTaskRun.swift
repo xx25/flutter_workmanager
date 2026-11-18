@@ -127,6 +127,9 @@ final class RefreshTaskRun {
     private var submitPending = false
     private var heldCompletion: Bool?
     private var submitDetail: String?
+    /// Held so the timers live as long as the run; they fire once and
+    /// find `completed` set when the run ended first.
+    private var stopTimers: [DispatchSourceTimer] = []
 
     /// How long after a failed submit the next attempt is made.
     static let submitRetryDelays: [TimeInterval] = [1, 3, 8]
@@ -188,17 +191,26 @@ final class RefreshTaskRun {
     }
 
     /// Arms the app's own stops, counted from `launchedAt`.
+    ///
+    /// Strict timers: `asyncAfter` lets the system defer a block by a
+    /// tenth of its delay (measured on an iPhone: a 16 s stop at 17.4 s),
+    /// and a hard stop deferred that far lands past the budget it guards.
     func arm(_ stops: RefreshTaskStops, launchedAt: Date) {
         if let soft = stops.softAfter {
-            queue.asyncAfter(deadline: .now() + max(0, launchedAt.addingTimeInterval(soft).timeIntervalSinceNow)) {
-                self.softStop()
-            }
+            stopTimers.append(strictTimer(at: launchedAt.addingTimeInterval(soft)) { self.softStop() })
         }
         if let hard = stops.hardAfter {
-            queue.asyncAfter(deadline: .now() + max(0, launchedAt.addingTimeInterval(hard).timeIntervalSinceNow)) {
-                self.hardStop()
-            }
+            stopTimers.append(strictTimer(at: launchedAt.addingTimeInterval(hard)) { self.hardStop() })
         }
+    }
+
+    private func strictTimer(at date: Date, _ fire: @escaping () -> Void) -> DispatchSourceTimer {
+        let timer = DispatchSource.makeTimerSource(flags: .strict, queue: queue)
+        timer.schedule(
+            deadline: .now() + max(0, date.timeIntervalSinceNow), leeway: .milliseconds(20))
+        timer.setEventHandler(handler: fire)
+        timer.resume()
+        return timer
     }
 
     /// Asks Dart to wind down. Nothing is forced.
